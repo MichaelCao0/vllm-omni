@@ -352,8 +352,11 @@ Under an artificial 33-block KV budget, four fixed English passages completed
 with three observed scheduler preemptions and three model replay records.
 All four transcript similarities exceeded 0.8. One pressure-run utterance
 repeated its last phrase (score 0.8921); the same four prompts without pressure
-scored 1.0 and did not repeat that phrase. The pressure result contained 23 more
-AR generation steps, with exactly the corresponding additional audio samples.
+scored 1.0 and did not repeat that phrase. The pressure result had 140 completion
+tokens and 27.0 seconds of audio, versus 116 tokens and 22.2 seconds in the
+four-request control, or 117 tokens and 22.4 seconds in a separate single-request
+control. These are 24 and 23 additional AR steps, respectively, with the
+corresponding additional audio samples.
 This is a generation-content difference; the cause is not established by the
 test. Do not interpret replay support as identical speech across batch shapes
 or as a guarantee against generated repetition. CRQ KV remains resident on the

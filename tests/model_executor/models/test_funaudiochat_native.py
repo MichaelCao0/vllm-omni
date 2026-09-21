@@ -181,12 +181,41 @@ def test_postprocess_does_not_rewrite_sampler_output_even_if_force_flag_is_prese
     assert model._speech_state["req0"][fac_mod._GENERATE_SPEECH_KEY] is False
 
 
-def test_postprocess_commits_audio_eos_without_rewriting_logprob_token():
+def test_postprocess_keeps_speech_active_for_text_audio_eos_without_codec_eos():
     model = _make_model_stub()
     model._speech_state["req0"] = {fac_mod._GENERATE_SPEECH_KEY: True}
     tokens = torch.tensor([99])
-    assert model.postprocess_sampled_tokens(tokens, ["req0"], {"req0": 0}, {}) is tokens
+    step = {"req0": {fac_mod._FINISH_SPEECH_KEY: False}}
+
+    assert model.postprocess_sampled_tokens(tokens, ["req0"], {"req0": 0}, step) is tokens
+    assert tokens.tolist() == [99]
+    assert model._speech_state["req0"][fac_mod._GENERATE_SPEECH_KEY] is True
+
+
+@pytest.mark.parametrize("sampled_token", [7, 42, 99], ids=["text", "audio-bos", "audio-eos"])
+def test_postprocess_codec_eos_finishes_speech_without_rewriting_sampled_token(sampled_token):
+    model = _make_model_stub()
+    model._speech_state["req0"] = {fac_mod._GENERATE_SPEECH_KEY: True}
+    tokens = torch.tensor([sampled_token])
+    step = {"req0": {fac_mod._FINISH_SPEECH_KEY: True}}
+
+    assert model.postprocess_sampled_tokens(tokens, ["req0"], {"req0": 0}, step) is tokens
+    assert tokens.tolist() == [sampled_token]
     assert model._speech_state["req0"][fac_mod._GENERATE_SPEECH_KEY] is False
+
+
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("sampled_token", [42, 99], ids=["audio-bos", "audio-eos"])
+def test_pure_replay_does_not_commit_sampled_speech_transitions(active, sampled_token):
+    model = _make_model_stub()
+    previous = {fac_mod._GENERATE_SPEECH_KEY: active, fac_mod._FORCE_AUDIO_BOS_KEY: True}
+    model._speech_state["req0"] = previous.copy()
+    tokens = torch.tensor([sampled_token])
+    step = {"req0": {"has_live_step": False, fac_mod._FINISH_SPEECH_KEY: True}}
+
+    assert model.postprocess_sampled_tokens(tokens, ["req0"], {"req0": 0}, step) is tokens
+    assert tokens.tolist() == [sampled_token]
+    assert model._speech_state["req0"] == previous
 
 
 def test_postprocess_rejects_speculative_tokens():

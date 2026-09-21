@@ -331,6 +331,48 @@ def test_replay_after_audio_eos_preserves_historical_speech_feedback(replay_mode
     assert torch.all(delta == -1)
 
 
+def test_text_audio_eos_keeps_live_codec_feedback_across_replay_until_codec_eos(replay_model):
+    model = replay_model
+    prompt, _, _ = _step(model, [1, 2, 3], 0)
+    first, _, _ = _step(model, [42], 3)
+
+    def sample_text_audio_eos(*, logits, sampling_metadata, forced_token_ids):
+        token = 99 if forced_token_ids[0] is None else forced_token_ids[0]
+        return SamplerOutput(sampled_token_ids=torch.tensor([[token]]), logprobs_tensors=None)
+
+    model._ar_sampler = sample_text_audio_eos
+    speech, token, codes = _step(model, [7], 4)
+    assert token.item() == 99
+    assert torch.all(codes != 99)
+    assert model._speech_state["req"][fac._GENERATE_SPEECH_KEY] is True
+    calls = model.audio_invert_tower.calls
+    rng = model._crq_generators["req"].get_state().clone()
+    history = model._speech_ids_gpu_state["req"]
+
+    replayed, _, replay_delta = _step(model, [1, 2, 3, 42, 7], 0)
+
+    assert torch.equal(replayed, torch.cat([prompt, first, speech]))
+    assert model.audio_invert_tower.calls == calls
+    assert torch.equal(model._crq_generators["req"].get_state(), rng)
+    assert model._speech_ids_gpu_state["req"] is history
+    assert model._speech_state["req"][fac._GENERATE_SPEECH_KEY] is True
+    assert torch.all(replay_delta == -1)
+
+    # The sampled text audio-EOS is now the live input. Codec feedback must
+    # still be blended, and this position must emit one more codec group.
+    next_input, _, next_codes = _step(model, [99], 5)
+    assert torch.equal(next_input, (torch.full((1, 4), 99.0) + codes.sum()) / 2)
+    assert model.audio_invert_tower.calls == calls + 1
+    assert model._speech_ids_gpu_state["req"].shape[-1] == history.shape[-1] + 2
+    assert torch.all(next_codes != 99)
+
+    model.audio_invert_tower.next_codes = torch.tensor([[99, 99]])
+    _, final_token, final_codes = _step(model, [99], 6)
+    assert final_token.item() == 99
+    assert torch.all(final_codes == 99)
+    assert model._speech_state["req"][fac._GENERATE_SPEECH_KEY] is False
+
+
 def test_replay_before_audio_bos_does_not_reinitialize_prompt_sidecar(replay_model):
     model = replay_model
     model.sp_gen_kwargs["force_text_abos"] = False

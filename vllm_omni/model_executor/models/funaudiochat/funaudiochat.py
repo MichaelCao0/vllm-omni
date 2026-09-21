@@ -781,7 +781,6 @@ class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMult
         if sampled_token_ids.ndim == 2 and sampled_token_ids.shape[-1] != 1:
             raise ValueError("FunAudioChat does not support speculative decoding")
         audio_bos_id = int(self.config.text_config.audio_bos_index)
-        audio_eos_id = int(self.config.text_config.audio_eos_index)
         for rid in req_ids:
             step = model_intermediate_buffer.get(rid) or {}
             if not step.get("has_live_step", True) or not step.get("speech_enabled", True):
@@ -793,7 +792,11 @@ class FunAudioChatForConditionalGeneration(_NativeFunAudioChatBase, SupportsMult
             token_id = int(token.item())
             ss = self._speech_state.setdefault(rid, {})
             active = bool(ss.get(_GENERATE_SPEECH_KEY, step.get(_GENERATE_SPEECH_KEY, False)))
-            ss[_GENERATE_SPEECH_KEY] = (active or token_id == audio_bos_id) and token_id != audio_eos_id
+            # The official loop ends speech on a CRQ codec EOS. A text-model
+            # audio_eos token alone must not stop codec generation or feedback.
+            # A codec EOS also takes precedence over a same-step audio BOS.
+            finished = bool(step.get(_FINISH_SPEECH_KEY, False))
+            ss[_GENERATE_SPEECH_KEY] = (active or token_id == audio_bos_id) and not finished
             ss[_FORCE_AUDIO_BOS_KEY] = False
         return sampled_token_ids
 

@@ -23,6 +23,8 @@ logger = init_logger(__name__)
 # Maps model architecture names to their HuggingFace model_type values.
 # Used when auto-injecting hf_overrides for models with missing config.json.
 _ARCH_TO_MODEL_TYPE: dict[str, str] = {
+    "FunAudioChatForConditionalGeneration": "funaudiochat",
+    "FunAudioChatCosyVoice3Code2Wav": "cosyvoice3",
     "CosyVoice3Model": "cosyvoice3",
     "GLMTTSForConditionalGeneration": "glm_tts",
     "IndexTTS2S2MelDecoder": "indextts2",

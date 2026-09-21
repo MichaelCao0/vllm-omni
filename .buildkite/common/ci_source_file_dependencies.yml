@@ -75,6 +75,28 @@ x-qwen2-5-omni: &qwen2_5_omni
   - vllm_omni/model_executor/stage_input_processors/qwen2_5_omni.py
   - vllm_omni/deploy/qwen2_5_omni.yaml
 
+x-funaudiochat: &funaudiochat
+  - vllm_omni/model_executor/models/funaudiochat/
+  - vllm_omni/model_executor/stage_input_processors/funaudiochat.py
+  - vllm_omni/transformers_utils/configs/funaudiochat.py
+  - vllm_omni/transformers_utils/configs/cosyvoice3.py
+  - vllm_omni/transformers_utils/configs/__init__.py
+  - vllm_omni/model_executor/models/cosyvoice3/
+  - vllm_omni/diffusion/models/cosyvoice3_audio/
+  - vllm_omni/diffusion/attention/
+  - vllm_omni/deploy/funaudiochat.yaml
+  - vllm_omni/config/pipeline_registry.py
+  - vllm_omni/config/stage_config.py
+  - vllm_omni/model_executor/models/registry.py
+  - vllm_omni/engine/arg_utils.py
+  - vllm_omni/worker/gpu_ar_model_runner.py
+  - vllm_omni/worker/gpu_generation_model_runner.py
+  - vllm_omni/worker/gpu_model_runner.py
+  - vllm_omni/entrypoints/openai/serving_chat.py
+  - vllm_omni/distributed/omni_connectors/
+  - vllm_omni/outputs/multimodal_accumulation.py
+  - requirements/
+
 x-qwen3-omni: &qwen3_omni
   - vllm_omni/engine/async_omni_engine.py
   - vllm_omni/entrypoints/omni_base.py
@@ -188,6 +210,11 @@ source_file_dependencies:
 
   # --- models ---
   # --- omni / tts jobs ---
+  omni_funaudiochat_function:
+    - *funaudiochat
+    - tests/e2e/offline_inference/test_fun_audio_chat.py
+    - tests/e2e/online_serving/test_fun_audio_chat.py
+
   omni_qwen3_omni_function:
     - *qwen3_omni
     - tests/e2e/offline_inference/test_qwen3_omni.py

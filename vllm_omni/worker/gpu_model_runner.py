@@ -1584,7 +1584,10 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
         This helper is intentionally small and self-contained so that it can be
         unit-tested to prevent regressions when updating MiMoAudio handling.
         """
-        if req_state is None or self.model.__class__.__name__ != "MiMoAudioForConditionalGeneration":
+        wants_mm_features = getattr(self.model, "wants_mm_features_in_preprocess", False)
+        if req_state is None or (
+            self.model.__class__.__name__ != "MiMoAudioForConditionalGeneration" and not wants_mm_features
+        ):
             return req_infos
 
         # Always operate on a dict copy to avoid mutating shared instances.

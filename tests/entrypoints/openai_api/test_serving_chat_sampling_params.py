@@ -611,6 +611,60 @@ def test_apply_request_overrides_applies_values(mock_engine_client, mock_request
     assert result.top_k == 1  # YAML custom param preserved
 
 
+@pytest.mark.parametrize(
+    ("request_kwargs", "expected_logprobs", "expected_token_ids"),
+    [
+        ({"logprobs": True, "top_logprobs": 5}, 5, None),
+        ({"logprobs": True}, 0, None),
+        ({"logprobs": False}, None, None),
+        ({"logprobs": True, "logprob_token_ids": [11, 12]}, None, [11, 12]),
+        ({"logprobs": True, "logprob_token_ids": []}, 0, None),
+    ],
+    ids=["top-logprobs", "sampled-token-only", "disabled", "specific-tokens", "empty-token-ids"],
+)
+def test_apply_request_overrides_logprobs(mock_engine_client, request_kwargs, expected_logprobs, expected_token_ids):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    default_params = SamplingParams(logprobs=2)
+    request = ChatCompletionRequest(model="test", messages=[], **request_kwargs)
+
+    result = serving_chat._apply_request_overrides(default_params, request)
+
+    assert result.logprobs == expected_logprobs
+    assert result.logprob_token_ids == expected_token_ids
+    assert default_params.logprobs == 2
+    assert default_params.logprob_token_ids is None
+
+
+@pytest.mark.parametrize(
+    "default_kwargs",
+    [{"logprobs": 2}, {"logprob_token_ids": [11, 12]}],
+    ids=["top-logprobs", "specific-tokens"],
+)
+def test_apply_request_overrides_omitted_logprobs_preserves_defaults(mock_engine_client, default_kwargs):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    default_params = SamplingParams(**default_kwargs)
+    request = ChatCompletionRequest(model="test", messages=[])
+
+    result = serving_chat._apply_request_overrides(default_params, request)
+
+    assert result.logprobs == default_params.logprobs
+    assert result.logprob_token_ids == default_params.logprob_token_ids
+
+
+def test_request_logprobs_only_overrides_comprehension_stage(mock_engine_client):
+    serving_chat = build_serving_chat(engine_client=mock_engine_client)
+    default_params = [SamplingParams(logprobs=None), SamplingParams(logprobs=2)]
+    mock_engine_client.default_sampling_params_list = default_params
+    request = ChatCompletionRequest(model="test", messages=[], logprobs=True, top_logprobs=5)
+
+    result = serving_chat._build_sampling_params_list_from_request(request)
+
+    assert result[0].logprobs == 5
+    assert result[1].logprobs == 2
+    assert result[1] is not default_params[1]
+    assert default_params[0].logprobs is None
+
+
 # =============================================================================
 # Tests for empty-list handling in _apply_request_overrides
 # =============================================================================

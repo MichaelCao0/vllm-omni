@@ -800,6 +800,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduled_seq_len=scheduled_seq_len,
         )
         payload.update(mm_payload)
+        # Some speech sidecars emit their per-request codec delta in
+        # postprocess, after the backbone forward has returned its outputs.
+        # Snapshot only declared payload keys, never model-local KV state.
+        buffer_keys = getattr(self.model, "pooler_output_buffer_keys", ())
+        if buffer_keys:
+            req_buffer = self.model_intermediate_buffer.get(rid, {})
+            payload.update(build_mm_cpu({key: req_buffer[key] for key in buffer_keys if key in req_buffer}))
         return payload
 
     def _merge_model_kv_transfer_metadata(
@@ -1771,6 +1778,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         if not needs_pooler_payload and prefix_cache_step_id is not None:
             # No consumer for this step's merge: consume the step context by
             # id (exactly-once contract). The cache write still lands.
+            assert self.omni_prefix_cache is not None
             self.omni_prefix_cache.discard_step(prefix_cache_step_id)
             prefix_cache_step_id = None
         if self.omni_prefix_cache is None and needs_scheduled_hidden_payload and not audio_sparse_output:

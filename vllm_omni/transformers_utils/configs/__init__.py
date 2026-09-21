@@ -10,6 +10,8 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
+    "FunAudioChatConfig": "vllm_omni.transformers_utils.configs.funaudiochat",
+    "FunAudioChatAudioEncoderConfig": "vllm_omni.transformers_utils.configs.funaudiochat",
     "Audio8TTSConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSSlowARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
     "Audio8TTSFastARConfig": "vllm_omni.transformers_utils.configs.audio8_tts",
@@ -38,6 +40,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
 }
 
 __all__ = [
+    "FunAudioChatConfig",
+    "FunAudioChatAudioEncoderConfig",
     "Audio8TTSConfig",
     "AuKConfig",
     "Audio8TTSFastARConfig",
@@ -85,6 +89,7 @@ from vllm_omni.transformers_utils.configs import audio8_tts as _audio8_tts  # no
 from vllm_omni.transformers_utils.configs import auk as _auk  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import cosyvoice3 as _cosyvoice3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
+from vllm_omni.transformers_utils.configs import funaudiochat as _funaudiochat  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import glm_tts as _glm_tts  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import higgs_audio_v3 as _higgs_audio_v3  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402

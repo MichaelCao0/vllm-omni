@@ -106,6 +106,42 @@ steps:
               -- -m 'advanced_model and cuda' --run-level 'advanced_model'
         mirror_hardwares: l4_1
 
+      - label: "Omni · Fun-Audio-Chat Test"
+        source_file_dependencies: omni_funaudiochat_function
+        # FA2 builds against this image's Torch ABI before the model checks.
+        timeout_in_minutes: 90
+        commands:
+          - |
+            set -euo pipefail
+            export FUN_AUDIO_CHAT_HOME="$(mktemp -d /tmp/funaudiochat-ci.XXXXXX)"
+            git clone https://github.com/FunAudioLLM/Fun-Audio-Chat.git "$FUN_AUDIO_CHAT_HOME"
+            git -C "$FUN_AUDIO_CHAT_HOME" checkout 8ba984b64b4880918db2807e08d795475481200c
+            export PYTHONPATH="$PWD:$FUN_AUDIO_CHAT_HOME:${PYTHONPATH:-}"
+            export VLLM_USE_FLASHINFER_SAMPLER=0
+            # The vLLM base image supplies nvcc; compile only for these H100s.
+            python -c "from pathlib import Path; from torch.utils.cpp_extension import CUDA_HOME; assert CUDA_HOME and (Path(CUDA_HOME) / 'bin/nvcc').is_file(), 'A CUDA toolkit with nvcc is required'"
+            python -m pip install --no-deps packaging psutil ninja setuptools wheel
+            export FLASH_ATTENTION_FORCE_BUILD=TRUE FLASH_ATTN_CUDA_ARCHS=90
+            export MAX_JOBS=4 NVCC_THREADS=2
+            python -m pip install --no-build-isolation --no-deps --no-cache-dir --force-reinstall \
+              'https://files.pythonhosted.org/packages/01/7a/92a46e7cd6bbb4d7b2855a457c3b855df54a97af5656d98fc92e58e61065/flash_attn-2.8.3.post1.tar.gz#sha256=55d5103ed846da8b56e0797acf4bde07dee4b1c7e8907fcfc6699c203030c348'
+            python -c "import flash_attn; from funaudiochat.modeling_funaudiochat import FunAudioChatDecoder"
+            # Resolve immutable checkpoints before passing local paths to both stages.
+            FUNAUDIOCHAT_MODEL="$(hf download FunAudioLLM/Fun-Audio-Chat-8B --revision 7bf72dc7c705493f817178a0859efff91e9cf73c)"
+            FUNAUDIOCHAT_CODEC_DIR="$(hf download FunAudioLLM/Fun-CosyVoice3-0.5B-2512 --revision 29e01c4e8d000f4bcd70751be16fa94bf3d85a18)"
+            export FUNAUDIOCHAT_MODEL FUNAUDIOCHAT_CODEC_DIR
+            export FUNAUDIOCHAT_DEPLOY_CONFIG="$FUN_AUDIO_CHAT_HOME/omni-deploy.yaml"
+            python - <<'PYCONFIG'
+            import os
+            from pathlib import Path
+            import yaml
+            config = yaml.safe_load(Path("vllm_omni/deploy/funaudiochat.yaml").read_text())
+            config["stages"][1]["model"] = os.environ["FUNAUDIOCHAT_CODEC_DIR"]
+            Path(os.environ["FUNAUDIOCHAT_DEPLOY_CONFIG"]).write_text(yaml.safe_dump(config, sort_keys=False))
+            PYCONFIG
+            pytest -s -v tests/e2e/offline_inference/test_fun_audio_chat.py tests/e2e/online_serving/test_fun_audio_chat.py -m 'advanced_model and cuda' --run-level advanced_model
+        mirror_hardwares: h100_2
+
       - label: "Omni · Qwen3-Omni Test"
         source_file_dependencies: omni_qwen3_omni_function
         timeout_in_minutes: 50

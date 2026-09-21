@@ -2,6 +2,15 @@
 
 This guide explains the compatibility matrix of different diffusion features in vLLM-Omni. You can use cache methods together with parallelism methods and other features to achieve optimal speed and efficiency.
 
+## Speech conversation profiles
+
+Speech pipelines have separate input-streaming and output-streaming contracts.
+The diffusion acceleration combinations below do not imply support in these pipelines.
+
+| Model | Input | Output | Feature qualification |
+| --- | --- | --- | --- |
+| [Fun-Audio-Chat](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FunAudioLLM/Fun-Audio-Chat-H200.md) | One complete audio turn | Text and asynchronous audio chunks | Two-stage H200, up to four concurrent requests exercised; continuous input and duplex are not implemented; prefix caching, chunked prefill, CUDA graphs, and async scheduling are disabled |
+
 ## Overview
 
 vLLM-Omni supports combining:
@@ -154,7 +163,6 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
   --ring 2
 ```
 
-
 ## Limitations
 
 ### Incompatibilities
@@ -174,7 +182,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 ### Configuration Constraints
 
 - **GPU Count Must Match Parallel Degrees**: Total GPU count must satisfy:
-  ```
+  ```text
   total_gpus = ulysses_degree × ring_degree × cfg_parallel_size × tensor_parallel_size
   ```
   Any mismatch will cause a configuration error at startup.
@@ -190,6 +198,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 **Symptoms:** Adding more GPUs doesn't improve speed proportionally
 
 **Solutions:**
+
 1. Check GPU communication bandwidth (use `nvidia-smi topo -m`)
 2. Reduce parallelism degree if communication overhead is high
 3. For very long sequences, prefer Ring-Attention over Ulysses-SP
@@ -200,6 +209,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 **Symptoms:** OOM errors when combining methods
 
 **Solutions:**
+
 1. Enable Tensor Parallelism to shard weights
 2. Reduce resolution or batch size
 3. Combine with memory efficient methods, such as cpu offloading
@@ -209,6 +219,7 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 \
 **Symptoms:** Errors about invalid parallel configuration
 
 **Solutions:**
+
 1. Verify total GPU count matches: `ulysses × ring × cfg × tp`
 2. Check model supports all enabled methods
 3. Ensure divisibility constraints (e.g., Z-Image TP=1 or 2 only)

@@ -9,6 +9,16 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "FunAudioChatForConditionalGeneration": (
+        "funaudiochat",
+        "funaudiochat",
+        "FunAudioChatForConditionalGeneration",
+    ),
+    "FunAudioChatCosyVoice3Code2Wav": (
+        "funaudiochat",
+        "funaudiochat_code2wav",
+        "FunAudioChatCosyVoice3Code2Wav",
+    ),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",

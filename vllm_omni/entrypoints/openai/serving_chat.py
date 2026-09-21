@@ -1354,7 +1354,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Pydantic v2 uses `model_fields_set`; keep v1 fallback for compatibility.
         explicit_fields = getattr(request, "model_fields_set", None)
         if explicit_fields is None:
-            explicit_fields = getattr(request, "__fields_set__", set())
+            explicit_fields = getattr(request, "__fields_set__", None) or set()
 
         for field_name in self._OPENAI_SAMPLING_FIELDS:
             if field_name not in explicit_fields:
@@ -1363,6 +1363,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             value = getattr(request, field_name, None)
             if (value is not None and not isinstance(value, list)) or (isinstance(value, list) and len(value) > 0):
                 setattr(params, field_name, value)
+
+        # OpenAI uses a bool plus a count, while SamplingParams.logprobs is the
+        # count itself. Match ChatCompletionRequest.to_sampling_params when
+        # explicitly requested, including disabling YAML defaults with False.
+        if any(field in explicit_fields for field in ("logprobs", "top_logprobs", "logprob_token_ids")):
+            params.logprobs = request.top_logprobs if request.logprobs and not request.logprob_token_ids else None
+            params.logprob_token_ids = request.logprob_token_ids or None
 
         return params
 

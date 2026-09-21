@@ -13,7 +13,7 @@ import io
 import json
 import time
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -111,6 +111,10 @@ class OmniResponse:
     cached_tokens: int | None = None
     multimodal_tokens: dict[str, int] | None = None
     logprobs: list | None = None
+    # Preserve every terminal event so model tests can detect truncation or
+    # duplicated streaming finishes without replacing the shared client.
+    finish_reasons: list[str] = field(default_factory=list)
+    completion_tokens: int | None = None
 
 
 @dataclass
@@ -422,6 +426,8 @@ class OnlineOmniClient:
             audio_data = []
             for chunk in chat_completion:
                 for choice in chunk.choices:
+                    if finish_reason := getattr(choice, "finish_reason", None):
+                        result.finish_reasons.append(finish_reason)
                     content = getattr(getattr(choice, "delta", None), "content", None)
                     modality = getattr(chunk, "modality", None)
                     if modality == "audio" and content:
@@ -431,6 +437,7 @@ class OnlineOmniClient:
                 # Usage is yielded after the last token
                 if chunk.usage:
                     result.prompt_tokens = chunk.usage.prompt_tokens
+                    result.completion_tokens = chunk.usage.completion_tokens
                     if details := getattr(chunk.usage, "prompt_tokens_details", None):
                         result.cached_tokens = details.cached_tokens
                         result.multimodal_tokens = getattr(details, "multimodal_tokens", None)
@@ -456,6 +463,8 @@ class OnlineOmniClient:
             audio_data = None
             text_content = None
             for choice in chat_completion.choices:
+                if finish_reason := getattr(choice, "finish_reason", None):
+                    result.finish_reasons.append(finish_reason)
                 if hasattr(choice.message, "audio") and choice.message.audio is not None:
                     audio_data = choice.message.audio.data
                 if hasattr(choice.message, "content") and choice.message.content is not None:
@@ -464,6 +473,7 @@ class OnlineOmniClient:
             usage = getattr(chat_completion, "usage", None)
             if usage:
                 result.prompt_tokens = usage.prompt_tokens
+                result.completion_tokens = usage.completion_tokens
                 if details := getattr(usage, "prompt_tokens_details", None):
                     result.cached_tokens = details.cached_tokens
                     result.multimodal_tokens = getattr(details, "multimodal_tokens", None)

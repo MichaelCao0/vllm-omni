@@ -105,6 +105,7 @@ For complete examples with model-specific inputs and outputs, see:
 
 - [Qwen3-Omni](../user_guide/examples/online_serving/qwen3_omni.md)
 - [Qwen2.5-Omni](../user_guide/examples/online_serving/qwen2_5_omni.md)
+- [Fun-Audio-Chat: complete-turn speech input and streaming audio output](https://github.com/vllm-project/vllm-omni/blob/main/recipes/FunAudioLLM/Fun-Audio-Chat-H200.md)
 - [Text-to-Image (Qwen-Image)](../user_guide/examples/online_serving/text_to_image.md)
 - [Image-to-Image (Qwen-Image-Edit, Qwen-Image-Layered)](../user_guide/examples/online_serving/image_to_image.md)
 - [GLM-Image](../user_guide/examples/online_serving/glm_image.md)

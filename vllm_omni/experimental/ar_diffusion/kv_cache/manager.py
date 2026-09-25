@@ -209,6 +209,13 @@ class ARDiffusionKVCache:
             raise ValueError("Phase 1 requires a bounded window (window_chunks)")
         if config.chunk_size <= 0:
             raise ValueError("ARDiffusionKVConfig.chunk_size must be set (> 0)")
+        if block_size != config.chunk_size:
+            # This allocator counts resident frames as physical blocks. Small
+            # pages require a separate geometry contract and demand formula.
+            raise ValueError(
+                "ARDiffusionKVCache requires block_size == chunk_size, got "
+                f"block_size={block_size}, chunk_size={config.chunk_size}"
+            )
         if not kv_branches:
             raise ValueError("ARDiffusionKVCache requires at least one KV branch")
         if session_capacity <= 0:
@@ -312,8 +319,11 @@ class ARDiffusionKVCache:
             for name, length in self.cross_attention_lengths.items()
         )
 
+        resident_per_session = config.sink_chunks + config.window_chunks
+
         def _required_managed_blocks(capacity: int) -> int:
-            resident_per_session = config.sink_chunks + config.window_chunks
+            # One null block and one spare, in addition to all resident windows
+            # and one in-flight span per worker-local branch.
             return self.num_local_kv_branches * (capacity * resident_per_session + self.frames_per_block) + 2
 
         # reuse_history_staging keeps one contiguous K and V buffer per layer,
@@ -385,8 +395,19 @@ class ARDiffusionKVCache:
             - self.cross_attention_reserved_bytes
             - self.model_owned_state_reserved_bytes
         )
-        num_blocks = self_attn_budget_bytes // page_size_bytes
-        assert num_blocks >= required_managed_blocks
+        self.budget_limited_blocks = self_attn_budget_bytes // page_size_bytes
+        assert self.budget_limited_blocks >= required_managed_blocks
+        # Admission has already selected the largest feasible session count.
+        # Extra blocks cannot be reached by those windows and the single
+        # in-flight request, so leave their memory available to other work.
+        num_blocks = required_managed_blocks
+        _log.info(
+            "AR-Diffusion managed KV: allocated=%d budget_limit=%d resident_capacity=%d pool=%.1f MiB",
+            num_blocks,
+            self.budget_limited_blocks,
+            effective_capacity,
+            (num_blocks + self.scratch_num_blocks) * page_size_bytes / (1024 * 1024),
+        )
         if effective_capacity < session_capacity:
             _log.warning(
                 "AR-Diffusion resident session capacity reduced from %d to %d by the KV memory budget",
@@ -637,6 +658,12 @@ class ARDiffusionKVCache:
         """Allocate managed blocks for an in-flight video span without committing it."""
         if num_tokens <= 0:
             raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+        max_in_flight_tokens = self.frames_per_block * self.spec.chunk_size
+        if num_tokens > max_in_flight_tokens:
+            raise ValueError(
+                f"AR-Diffusion in-flight span of {num_tokens} tokens exceeds the pooled bound "
+                f"frames_per_block * chunk_size = {max_in_flight_tokens}; check the model's declared geometry"
+            )
         # vLLM clips slot allocation at max_model_len. Admit the entire
         # in-flight span in compact storage coordinates, independent of the
         # model's absolute frame positions.

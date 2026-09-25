@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for the ARDiffusionKVState paged-attention pipeline bridge."""
 
 import pytest
@@ -38,6 +39,8 @@ def make_state(num_layers=1, window_chunks=4, cross_attn_length=0, shared_local_
             ARDiffusionKVBranchSpec(NEG, 0 if shared_local_index else 1),
         ),
         session_capacity=2,
+        # These fixtures commit up to three frames in a single forward.
+        frames_per_block=3,
         cross_attention_lengths={"text": cross_attn_length} if cross_attn_length else None,
         device=torch.device("cpu"),
     )

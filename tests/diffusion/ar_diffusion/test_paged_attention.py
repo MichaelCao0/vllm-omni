@@ -52,7 +52,8 @@ def make_state(
         available_bytes=1 << 26,
         kv_branches=(ARDiffusionKVBranchSpec(POS, 0), ARDiffusionKVBranchSpec(NEG, 1)),
         session_capacity=2,
-        frames_per_block=2,
+        # History fixtures commit up to three frames in one forward.
+        frames_per_block=3,
         max_scratch_tokens_per_branch=BLOCK,
         device=device,
     )

@@ -184,7 +184,7 @@ def test_key_and_value_caches_do_not_share_storage():
         dtype=torch.float32,
         device=torch.device("cpu"),
     )
-    seen = set()
+    seen: set[int] = set()
     for layer, (key_cache, value_cache) in enumerate(kv_pools):
         k_storage = key_cache.untyped_storage().data_ptr()
         v_storage = value_cache.untyped_storage().data_ptr()
@@ -351,10 +351,11 @@ def test_cross_attn_pool_deducted_from_self_attn_budget():
     page_bytes = kv.spec.page_size_bytes * 2
     scratch_bytes = kv.scratch_num_blocks * page_bytes
     expected = (int(avail * 0.5) - cross_bytes - scratch_bytes) // page_bytes
-    assert kv.num_blocks == expected
+    assert kv.budget_limited_blocks == expected
     assert kv.cross_attention_reserved_bytes == cross_bytes
     assert (kv.num_blocks_total * page_bytes) + cross_bytes <= int(avail * 0.5)
-    assert expected > 1 * (2 + 1) + 2  # above the local-slot minimum, so the cross deduction is what's tested
+    assert kv.num_blocks == 1 * (2 + 1) + 2
+    assert expected > kv.num_blocks  # Surplus budget stays unallocated.
 
 
 def _make_tiny_capacity_kv(
@@ -526,6 +527,7 @@ def _make_kv(
     num_frame_per_block=2,
     window_chunks=9,
     max_scratch_tokens_per_branch=0,
+    available_bytes=None,
 ):
     kv_branches = (
         (ARDiffusionKVBranchSpec("positive", 0), ARDiffusionKVBranchSpec("negative", 0))
@@ -536,6 +538,8 @@ def _make_kv(
     declared_scratch_blocks = (max_scratch_tokens_per_branch + BLOCK - 1) // BLOCK
     scratch_blocks = local_branches * (num_frame_per_block + declared_scratch_blocks)
     managed_blocks = local_branches * (window_chunks + num_frame_per_block) + 2
+    if available_bytes is None:
+        available_bytes = (managed_blocks + scratch_blocks) * page_bytes
     return ARDiffusionKVCache(
         ARDiffusionKVConfig(
             enable=True,
@@ -549,7 +553,7 @@ def _make_kv(
         dtype=torch.float32,
         block_size=BLOCK,
         max_model_len=4096,
-        available_bytes=(managed_blocks + scratch_blocks) * page_bytes,
+        available_bytes=available_bytes,
         device=torch.device("cpu"),
         kv_branches=kv_branches,
         session_capacity=1,
@@ -570,6 +574,123 @@ def test_pool_floor_is_branch_aware():
     assert two.scratch_num_blocks == 2 * two.scratch_blocks_per_kv_branch
     assert one.scratch_blocks_per_kv_branch == 2
     assert one.num_blocks_total == 13 + one.scratch_blocks_per_kv_branch
+
+
+ROOMY = 1 << 24  # ~32x the exact fit for the _make_kv geometry
+
+
+def test_surplus_budget_does_not_enlarge_the_managed_pool():
+    """The pool tracks reachable demand, so a bigger budget buys no extra blocks."""
+    tight = _make_kv(local_branches=1)
+    roomy = _make_kv(local_branches=1, available_bytes=ROOMY)
+
+    assert tight.managed_num_blocks == roomy.managed_num_blocks == 1 * (9 + 2) + 2
+    assert tight.session_capacity == roomy.session_capacity == 1
+    # The surplus the budget could afford is reported, not allocated.
+    assert tight.budget_limited_blocks == tight.managed_num_blocks
+    assert roomy.budget_limited_blocks > roomy.managed_num_blocks
+
+
+def test_fewer_local_branches_shrink_the_managed_pool_at_equal_budget():
+    """A model declaring fewer active branches allocates a smaller pool."""
+    one = _make_kv(local_branches=1, available_bytes=ROOMY)
+    two = _make_kv(local_branches=2, available_bytes=ROOMY)
+
+    assert one.managed_num_blocks == 1 * (9 + 2) + 2
+    assert two.managed_num_blocks == 2 * (9 + 2) + 2
+    assert one.num_blocks_total < two.num_blocks_total
+    # Shrinking the managed pool moves the scratch region down with it; the two
+    # must stay adjacent and disjoint.
+    for kv in (one, two):
+        assert kv.scratch_block_ids("positive", 0, 1) == [kv.managed_num_blocks]
+        assert max(kv.scratch_block_ids("positive", 0, kv.scratch_blocks_per_kv_branch)) < kv.num_blocks_total
+    # Same budget, and both leave surplus: branch count is what sized the pool.
+    assert one.memory_budget_bytes == two.memory_budget_bytes
+    assert one.budget_limited_blocks > one.managed_num_blocks
+    assert two.budget_limited_blocks > two.managed_num_blocks
+
+
+def test_resident_capacity_still_scales_the_managed_pool():
+    """Clamping must not collapse the pool to a single session's requirement."""
+    one = _make_tiny_capacity_kv(requested_capacity=1, available_bytes=1 << 13)
+    three = _make_tiny_capacity_kv(requested_capacity=3, available_bytes=1 << 13)
+
+    assert one.session_capacity == 1
+    assert three.session_capacity == 3
+    assert one.managed_num_blocks == 1 * (1 * 6 + 3) + 2
+    assert three.managed_num_blocks == 1 * (3 * 6 + 3) + 2
+
+
+@pytest.mark.parametrize("branches", [1, 2])
+@pytest.mark.parametrize("capacity", [1, 3])
+def test_demand_sized_pool_recycles_full_windows_without_exhaustion(branches, capacity):
+    """Exercise the allocation bound with every resident window full, then reset/reopen."""
+    kv = ARDiffusionKVCache(
+        ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=4, sink_chunks=2),
+        num_layers=1,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.bfloat16,
+        block_size=BLOCK,
+        max_model_len=BLOCK,
+        available_bytes=1 << 24,
+        kv_branches=tuple(ARDiffusionKVBranchSpec(f"branch-{i}", i) for i in range(branches)),
+        session_capacity=capacity,
+        frames_per_block=3,
+    )
+    assert kv.budget_limited_blocks > kv.managed_num_blocks
+    initial_free = kv.manager.block_pool.get_num_free_blocks()
+    for restart in range(2):
+        sessions = [
+            [kv.begin_request(f"{restart}-{session}-{branch}") for branch in range(branches)]
+            for session in range(capacity)
+        ]
+        for step in range(30):
+            for adapters in sessions:
+                # Sequential CFG can allocate all local branches before commit.
+                for adapter in adapters:
+                    kv.allocate_token_slots(adapter, 3 * BLOCK)
+                    assert kv.manager.max_model_len >= adapter.num_computed_tokens + 3 * BLOCK
+                for adapter in adapters:
+                    for _ in range(3):
+                        kv.commit_chunk(adapter)
+                    assert len(kv.window_block_ids(adapter)) <= 6
+            resident = [set(kv.window_block_ids(a)) for adapters in sessions for a in adapters]
+            assert sum(map(len, resident)) == len(set().union(*resident))
+            if step > 2:
+                assert all(len(blocks) == 6 for blocks in resident)
+        for adapters in sessions:
+            for adapter in adapters:
+                kv.end_request(adapter)
+        assert kv.manager.block_pool.get_num_free_blocks() == initial_free
+
+
+def test_oversized_inflight_span_fails_before_mutating_allocator():
+    kv = _make_tiny_capacity_kv(requested_capacity=1, available_bytes=1 << 13)
+    adapter = kv.begin_request("oversized")
+    before_free = kv.manager.block_pool.get_num_free_blocks()
+    before_len = kv.manager.max_model_len
+    with pytest.raises(ValueError, match="exceeds the pooled bound"):
+        kv.allocate_token_slots(adapter, 4)
+    assert kv.manager.max_model_len == before_len
+    assert kv.manager.block_pool.get_num_free_blocks() == before_free
+    assert kv.block_table(adapter) == []
+
+
+def test_demand_sized_pool_rejects_non_frame_aligned_pages():
+    with pytest.raises(ValueError, match="block_size == chunk_size"):
+        ARDiffusionKVCache(
+            ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=2),
+            num_layers=1,
+            num_kv_heads=1,
+            head_size=8,
+            dtype=torch.bfloat16,
+            block_size=BLOCK // 2,
+            max_model_len=1024,
+            available_bytes=1 << 20,
+            kv_branches=(ARDiffusionKVBranchSpec("main", 0),),
+            session_capacity=1,
+        )
 
 
 def test_scratch_capacity_is_derived_from_declared_geometry(monkeypatch):

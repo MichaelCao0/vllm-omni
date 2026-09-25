@@ -125,6 +125,7 @@ The runner computes:
 ```text
 required(capacity) =
     scratch
+  + worker_shared_history_staging
   + managed_self_attention_pages(capacity)
   + capacity * cross_attention_bytes_per_session
   + capacity * model_owned_state_bytes_per_session
@@ -142,6 +143,24 @@ Otherwise the runner always admits one viable session and uses the configured
 fraction to select additional resident sessions up to the model-declared cap.
 All model-owned reservations are deducted before the paged self-attention pool
 is allocated.
+
+For the current frame-aligned layout (`block_size == chunk_size`), the
+managed pool allocates only the blocks reachable by that selected capacity:
+
+```text
+managed_blocks = local_kv_branches * (
+    capacity * (sink_frames + window_frames) + frames_per_block
+) + 2
+```
+
+The last two blocks cover the allocator's null block and one spare. The
+worker executes one request at a time; the in-flight span is therefore
+reserved once per local KV branch, while every resident session retains its
+complete history window. A request cannot allocate a span larger than its
+declared `frames_per_block * chunk_size`. Surplus budget stays unallocated;
+this does not reduce the selected session capacity, window size, or KV dtype.
+Small-page layouts need their own block-demand calculation and are not part
+of this contract.
 
 LingBot advances a session-owned causal Wan VAE encoder for each condition
 block: the opening pixel frame is followed by four zero pixel frames per later

@@ -30,6 +30,7 @@ real-time factor comes out wrong on short rollouts.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -141,27 +142,56 @@ def _validate_camera_script(script: Sequence[Any]) -> list[list[list[str]]]:
 
 
 @dataclass(frozen=True)
-class PromptUpdate:
-    """A mid-rollout ``session.interaction`` scheduled on a chunk boundary."""
+class CameraUpdate:
+    """A structural camera interaction sent after a received media chunk."""
 
     after_chunk: int
-    prompt: str
-    transition_chunks: int = 3
+    mode: str = "target"
+    translation: Sequence[float] = (0.0, 0.0, 0.0)
+    rotation: Sequence[float] = (0.0, 0.0, 0.0, 1.0)
+    transition_chunks: int = 1
 
     def __post_init__(self) -> None:
-        if self.after_chunk < 0:
-            raise ValueError("PromptUpdate.after_chunk must be non-negative.")
-        if not self.prompt.strip():
-            raise ValueError("PromptUpdate.prompt must contain non-whitespace text.")
-        if self.transition_chunks < 0:
-            raise ValueError("PromptUpdate.transition_chunks must be non-negative.")
+        if isinstance(self.after_chunk, bool) or not isinstance(self.after_chunk, int) or self.after_chunk < 0:
+            raise ValueError("CameraUpdate.after_chunk must be a non-negative integer.")
+        if self.mode not in ("target", "velocity"):
+            raise ValueError("CameraUpdate.mode must be target or velocity.")
+        if (
+            isinstance(self.transition_chunks, bool)
+            or not isinstance(self.transition_chunks, int)
+            or self.transition_chunks < 0
+        ):
+            raise ValueError("CameraUpdate.transition_chunks must be a non-negative integer.")
+        for name, size in (("translation", 3), ("rotation", 4)):
+            value = getattr(self, name)
+            if (
+                not isinstance(value, Sequence)
+                or isinstance(value, (str, bytes))
+                or len(value) != size
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in value)
+            ):
+                raise ValueError(f"CameraUpdate.{name} must contain {size} finite numbers.")
+            object.__setattr__(self, name, tuple(float(v) for v in value))
+        if not any(self.rotation):
+            raise ValueError("CameraUpdate.rotation must be a nonzero quaternion (x, y, z, w).")
+
+    @property
+    def event_id(self) -> str:
+        return f"camera-after-{self.after_chunk}"
 
     def to_payload(self) -> dict[str, Any]:
         return {
             "type": "session.interaction",
             "interaction": {
-                "event_id": f"chunk-{self.after_chunk}",
-                "event": {"prompt": self.prompt},
+                "event_id": self.event_id,
+                "event": {
+                    "multi_modal_data": {
+                        "camera": {
+                            "mode": self.mode,
+                            "data": {"translation": list(self.translation), "rotation": list(self.rotation)},
+                        }
+                    }
+                },
                 "transition_chunks": self.transition_chunks,
             },
         }
@@ -173,14 +203,15 @@ class Workload:
 
     prompt: str
     image_reference: str
-    camera_script: list[list[list[str]]]
+    camera_script: list[list[list[str]]] | None = None
     width: int = DEFAULT_WIDTH
     height: int = DEFAULT_HEIGHT
     fps: int = DEFAULT_FPS
     seed: int = DEFAULT_SEED
     flow_shift: float = DEFAULT_FLOW_SHIFT
     negative_prompt: str | None = None
-    prompt_updates: tuple[PromptUpdate, ...] = ()
+    camera_updates: tuple[CameraUpdate, ...] = ()
+    live_num_chunks: int | None = None
     extra_params: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -192,20 +223,37 @@ class Workload:
             raise ValueError("Workload width/height must be positive multiples of 16.")
         if self.fps <= 0:
             raise ValueError("Workload.fps must be positive.")
-        object.__setattr__(self, "camera_script", _validate_camera_script(self.camera_script))
+        if self.camera_script is None:
+            if (
+                isinstance(self.live_num_chunks, bool)
+                or not isinstance(self.live_num_chunks, int)
+                or self.live_num_chunks < 1
+            ):
+                raise ValueError("Live camera workloads require a positive integer live_num_chunks.")
+        else:
+            object.__setattr__(self, "camera_script", _validate_camera_script(self.camera_script))
+            if self.live_num_chunks is not None or self.camera_updates:
+                raise ValueError("camera_action_script cannot be combined with live camera updates or length.")
+        if not isinstance(self.extra_params, Mapping):
+            raise ValueError("Workload extra_params must be a JSON object.")
+        # These bypass the workload's camera mode or its validated chunk count.
+        for key in ("camera_action_script", "action_path", "camera_actions", "camera_trajectory", "ar_diffusion_tick"):
+            if key in self.extra_params:
+                raise ValueError(f"Set camera controls through the workload, not extra_params.{key}.")
         seen_update_chunks: set[int] = set()
-        for update in self.prompt_updates:
+        for update in self.camera_updates:
             if update.after_chunk in seen_update_chunks:
-                raise ValueError(f"Duplicate prompt update after chunk {update.after_chunk}; event IDs must be unique.")
+                raise ValueError(f"Duplicate camera update after chunk {update.after_chunk}; event IDs must be unique.")
             seen_update_chunks.add(update.after_chunk)
-            if update.after_chunk >= self.num_chunks:
-                raise ValueError(
-                    f"Prompt update after chunk {update.after_chunk} never fires in a {self.num_chunks}-chunk rollout."
-                )
+            if update.after_chunk >= self.num_chunks - 1:
+                raise ValueError("Camera updates require a later media chunk; after_chunk must precede the last chunk.")
 
     @property
     def num_chunks(self) -> int:
-        return len(self.camera_script)
+        if self.camera_script is not None:
+            return len(self.camera_script)
+        assert self.live_num_chunks is not None
+        return self.live_num_chunks
 
     @property
     def num_frames(self) -> int:
@@ -219,8 +267,9 @@ class Workload:
         """The ``session.start`` event for ``WS /v1/realtime/video``."""
         extra_params: dict[str, Any] = {
             "flow_shift": self.flow_shift,
-            "camera_action_script": self.camera_script,
         }
+        if self.camera_script is not None:
+            extra_params["camera_action_script"] = self.camera_script
         extra_params.update(self.extra_params)
         payload: dict[str, Any] = {
             "type": "session.start",
@@ -248,12 +297,15 @@ class Workload:
             "seed": self.seed,
             "flow_shift": self.flow_shift,
             "video_seconds": self.video_seconds,
-            "prompt_updates": [
+            "camera_mode": "script" if self.camera_script is not None else "live",
+            "camera_updates": [
                 {
                     "after_chunk": update.after_chunk,
+                    "event_id": update.event_id,
+                    "camera": update.to_payload()["interaction"]["event"]["multi_modal_data"]["camera"],
                     "transition_chunks": update.transition_chunks,
                 }
-                for update in self.prompt_updates
+                for update in self.camera_updates
             ],
         }
 
@@ -307,27 +359,43 @@ def load_workload(
         if value is not None:
             merged[key] = value
 
+    if merged.get("prompt_updates"):
+        raise ValueError("LingBot-World does not support prompt_updates; use camera_updates in live camera mode.")
+    mode = merged.get("camera_mode", "script")
+    if mode not in ("script", "live"):
+        raise ValueError("camera_mode must be script or live.")
     camera_script = merged.get("camera_action_script")
-    if camera_script is None:
+    live_num_chunks = None
+    if mode == "live":
+        if camera_script is not None or "camera_pattern" in merged:
+            raise ValueError("Live camera mode cannot be combined with camera_action_script or camera_pattern.")
+        live_num_chunks = merged.get("num_chunks")
+    elif merged.get("camera_updates"):
+        raise ValueError("camera_updates require camera_mode=live.")
+    elif camera_script is None:
         num_chunks = merged.get("num_chunks")
         if num_chunks is None:
             raise ValueError("A workload file needs either camera_action_script or num_chunks.")
         camera_script = build_camera_script(int(num_chunks), str(merged.get("camera_pattern", "forward")))
 
+    updates_field = merged.get("camera_updates", [])
+    if not isinstance(updates_field, list):
+        raise ValueError("camera_updates must be a list.")
+    camera_updates = []
+    for entry in updates_field:
+        if not isinstance(entry, Mapping):
+            raise ValueError("Each camera update must be an object.")
+        unknown = set(entry) - {"after_chunk", "mode", "translation", "rotation", "transition_chunks"}
+        if unknown or "after_chunk" not in entry:
+            raise ValueError(
+                "Camera updates require after_chunk and support mode, translation, rotation, transition_chunks."
+            )
+        camera_updates.append(CameraUpdate(**entry))
+
     image = merged.get("image") or merged.get("image_reference")
     if image is None:
         raise ValueError("A workload file needs an image or image_reference field.")
     image_reference = image_resolver(str(image)) if image_resolver is not None else str(image)
-
-    updates_field = merged.get("prompt_updates") or ()
-    prompt_updates = tuple(
-        PromptUpdate(
-            after_chunk=int(entry["after_chunk"]),
-            prompt=str(entry["prompt"]),
-            transition_chunks=int(entry.get("transition_chunks", 3)),
-        )
-        for entry in updates_field
-    )
 
     extra_params = merged.get("extra_params") or {}
     if not isinstance(extra_params, Mapping):
@@ -343,7 +411,8 @@ def load_workload(
         seed=int(merged.get("seed", DEFAULT_SEED)),
         flow_shift=float(merged.get("flow_shift", DEFAULT_FLOW_SHIFT)),
         negative_prompt=merged.get("negative_prompt"),
-        prompt_updates=prompt_updates,
+        camera_updates=tuple(camera_updates),
+        live_num_chunks=live_num_chunks,
         extra_params=dict(extra_params),
     )
 
@@ -351,6 +420,46 @@ def load_workload(
 # --------------------------------------------------------------------------- #
 # Metrics
 # --------------------------------------------------------------------------- #
+
+
+@dataclass
+class InteractionRecord:
+    """Client-clock observations; event reporting does not prove visible motion."""
+
+    event_id: str
+    after_chunk: int
+    send_start_s: float
+    send_end_s: float | None = None
+    queued_s: float | None = None
+    first_media_s: float | None = None
+    first_media_chunk: int | None = None
+    first_states: tuple[str, ...] = ()
+
+    def observe_media(self, chunk: ChunkRecord) -> None:
+        states = tuple(
+            state
+            for state in ("started", "active", "completed")
+            if self.event_id in getattr(chunk, f"{state}_event_ids")
+        )
+        if states and self.first_media_s is None:
+            self.first_media_s = chunk.arrival_s
+            self.first_media_chunk = chunk.index
+            self.first_states = states
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "after_chunk": self.after_chunk,
+            "send_start_ms": self.send_start_s * 1000,
+            "send_end_ms": None if self.send_end_s is None else self.send_end_s * 1000,
+            "send_to_queued_ms": None if self.queued_s is None else (self.queued_s - self.send_start_s) * 1000,
+            "send_to_first_reported_media_ms": (
+                None if self.first_media_s is None else (self.first_media_s - self.send_start_s) * 1000
+            ),
+            "first_reported_media_chunk": self.first_media_chunk,
+            "first_reported_states": list(self.first_states),
+            "media_observation": "not_observed" if self.first_media_s is None else "reported",
+        }
 
 
 @dataclass
@@ -364,6 +473,9 @@ class ChunkRecord:
     """Seconds since the previous chunk; for chunk zero this equals ``arrival_s``."""
     byte_length: int
     num_frames: int
+    started_event_ids: tuple[str, ...] = ()
+    active_event_ids: tuple[str, ...] = ()
+    completed_event_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -372,6 +484,9 @@ class ChunkRecord:
             "inter_arrival_ms": self.inter_arrival_s * 1000.0,
             "byte_length": self.byte_length,
             "num_frames": self.num_frames,
+            "started_event_ids": list(self.started_event_ids),
+            "active_event_ids": list(self.active_event_ids),
+            "completed_event_ids": list(self.completed_event_ids),
         }
 
 

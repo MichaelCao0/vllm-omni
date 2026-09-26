@@ -205,6 +205,36 @@ class TestCoordinatorResolution:
 
 
 class TestCameraHandlers:
+    @pytest.mark.parametrize("mode", ["target", "velocity"])
+    def test_benchmark_camera_update_matches_registered_handler(self, mode: str) -> None:
+        from benchmarks.lingbot_world.workload import CameraUpdate
+
+        coordinator = InteractionCoordinator.build(
+            _FakeLingBotPipeline(), SimpleNamespace(model_class_name="LingBotWorldCausalDMDPipeline")
+        )
+        assert not coordinator.has_modality("prompt")
+        command = CameraUpdate(after_chunk=0, mode=mode, translation=(0.0, 0.0, 0.1))
+        interaction = command.to_payload()["interaction"]
+        state = _make_state()
+        for modality, payload in interaction["event"]["multi_modal_data"].items():
+            coordinator.enqueue(
+                state,
+                modality=modality,
+                payload=payload,
+                event_id=interaction["event_id"],
+                received_at=0.0,
+                transition_chunks=interaction["transition_chunks"],
+            )
+        handler = coordinator.get_handler("camera")
+        metadata = handler.apply_at_chunk_boundary(
+            state, boundary_at=1.0, chunk_index=1, num_media_frames=12, fps=16.0, num_latent_frames=3
+        )
+        assert metadata is not None and metadata.started_event_ids == [command.event_id]
+        session = state.interaction_sessions["camera"]
+        assert isinstance(session, CameraSession)
+        expected_distance = 0.1 if mode == "target" else 0.3
+        assert session.current_pose.translation[2] == pytest.approx(expected_distance)
+
     def test_rejects_wasd_actions_payload(self) -> None:
         handler = SE3DeltaCameraHandler()
         state = _make_state()

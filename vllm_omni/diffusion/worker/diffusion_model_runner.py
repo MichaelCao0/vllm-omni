@@ -1213,6 +1213,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 if _dit_any_rank_failed(per_req_exc is not None):
                     _abort_prep_failure(per_req_exc)
                     continue
+            elif state.extra.get("_interaction_chunk_pending", False):
+                # The engine drains collective RPCs between runner calls. Defer
+                # the boundary hook until this preparation phase so an
+                # interaction submitted while the previous chunk was finishing
+                # is visible before the next chunk is materialized.
+                if supports_interaction_apply(pipeline):
+                    pipe = cast(SupportsInteractionApply, pipeline)
+                    pipe.apply_interaction_at_chunk_boundary(state)
+                    pipe.prepare_next_chunk(state)
+                state.extra.pop("_interaction_chunk_pending", None)
             prepared_states.append(state)
 
         if not prepared_states:
@@ -1438,12 +1448,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                                         req,
                                         result,
                                     )
-                                    # After consuming this chunk's interaction metadata, apply pending interactions and
-                                    # prepare the next chunk (prepare_next_chunk may be a no-op---depending on pipeline)
+                                    # Apply the next interaction at the start of
+                                    # the next runner call. The engine drains RPCs
+                                    # between calls, so a control message that
+                                    # arrived at the boundary affects the
+                                    # immediately following chunk.
                                     if supports_interaction_apply(pipeline) and not req.request_denoise_completed:
-                                        pipe = cast(SupportsInteractionApply, pipeline)
-                                        pipe.apply_interaction_at_chunk_boundary(req)
-                                        pipe.prepare_next_chunk(req)
+                                        req.extra["_interaction_chunk_pending"] = True
                             else:
                                 result = None
                             # finished should be computed after post_decode() advanced chunk_index

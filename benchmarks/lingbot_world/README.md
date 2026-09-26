@@ -163,37 +163,86 @@ server for that. It also reports no GPU memory, which is a server-side quantity.
 
 ## Custom rollouts
 
-`--workload rollout.json` replaces the built-in workload, including mid-rollout
-prompt changes, which the CLI flags cannot express:
+`--workload rollout.json` replaces the built-in workload. The default
+`camera_mode: "script"` generates a fixed camera script from `num_chunks` and
+`camera_pattern`. Supply `camera_action_script` directly to control every
+frame's action; it takes precedence over those two fields and must contain one
+three-entry action list per chunk.
+
+For commands sent during generation, use `camera_mode: "live"` and an explicit
+`num_chunks`. The server holds the camera still until the first update. Live
+commands and a fixed `camera_action_script` or `camera_pattern` are mutually
+exclusive. LingBot-World currently supports camera interaction only;
+`prompt_updates` are rejected locally because the pipeline has no prompt handler.
 
 ```json
 {
   "prompt": "The camera moves slowly forward through the scene.",
   "image": "/path/to/first_frame.png",
   "num_chunks": 24,
-  "camera_pattern": "orbit",
+  "camera_mode": "live",
   "fps": 16,
   "seed": 42,
-  "prompt_updates": [
-    {"after_chunk": 8, "prompt": "Rain begins to fall", "transition_chunks": 2}
+  "camera_updates": [
+    {
+      "after_chunk": 2,
+      "mode": "target",
+      "translation": [0.0, 0.0, 1.0],
+      "rotation": [0.0, 0.0, 0.0, 1.0],
+      "transition_chunks": 2
+    },
+    {
+      "after_chunk": 8,
+      "mode": "velocity",
+      "translation": [0.01, 0.0, 0.0]
+    }
   ]
 }
 ```
 
-Supply `camera_action_script` directly instead of `num_chunks` to control every
-frame's action. It must hold exactly one three-entry action list per chunk; one
-AR block is three latent frames, and the server rejects any other shape.
+`after_chunk` is zero-based and triggers after that chunk's media bytes arrive.
+It must precede the final chunk and be unique within the workload; event IDs
+are generated as `camera-after-N`. This is a chunk-triggered workload, not an
+independent real-user arrival process. An event sent near the end may not be
+reported in any subsequent chunk if generation has already advanced.
+
+Camera coordinates follow the server's Unity convention: +X right, +Y up,
++Z forward. Rotations are nonzero quaternions in `(x, y, z, w)` order, normalized
+by the server. `target` gives a pose relative to session start and uses
+`transition_chunks`; `velocity` gives a per-latent-step SE3 delta held until
+replaced, and the server ignores `transition_chunks` in that mode. WASD strings
+are supported in fixed scripts, not in live structural camera updates.
+
 Explicit `--image`, `--prompt`, `--negative-prompt`, `--width`, `--height`,
 `--fps`, `--seed`, and `--flow-shift` flags override the matching workload-file
 values. `--num-chunks` and `--camera-pattern` apply only to the built-in
 workload; when using `--workload`, set those fields in the file instead.
-An explicit `camera_action_script` takes precedence over the file's
-`num_chunks` and `camera_pattern`. Each prompt update must use a distinct
-`after_chunk` boundary so its interaction event ID is unique.
+Camera controls cannot be injected through `extra_params`, which would bypass
+the workload's validated mode and length.
 
 Camera actions change what the world does, not what it costs, so `--camera-pattern`
 (`forward`, `orbit`, `hold`) keeps a rollout representative rather than sweeping a
 cost dimension.
+
+### Interaction observations
+
+Each session's JSON contains an `interactions` list. All observations use the
+client's monotonic clock, with send timestamps relative to `session.start`:
+
+- `send_to_queued_ms`: send start to the matching `session.interaction.queued` ACK.
+- `send_to_first_reported_media_ms`: send start to the first nonempty media
+  payload whose preceding metadata reports that event as started, active, or
+  completed. Metadata arrival alone is not media arrival.
+- `first_reported_media_chunk` and `first_reported_states`: the matching chunk
+  and its reported states. Per-chunk event ID lists are also retained.
+- Missing ACK or media observations remain `null`; `media_observation` is
+  `not_observed` when no matching media arrived before the session ended.
+
+ACK and media may arrive in either order. A reported event does not prove that
+its action changed the pixels or that a browser displayed them. In particular,
+the server can mark a replaced command as completed, even if a later command
+superseded it before pose integration. Do not interpret absent completion as a
+dropped event or these timings as motion-to-photon latency.
 
 ## Options worth knowing
 

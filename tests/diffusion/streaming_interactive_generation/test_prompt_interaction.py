@@ -525,6 +525,7 @@ class TestPromptUpdateExecution:
         DiffusionModelRunner.execute_stepwise(runner, scheduler_output)  # pyright: ignore[reportArgumentType]
         assert "req" in runner.state_cache
         assert runner.state_cache["req"].sampling.fps is None
+        pipeline.prepare_next_chunk.reset_mock()
 
         runner.submit_interaction("req", _prompt_interaction("new scene", transition_chunks=2))
 
@@ -533,18 +534,25 @@ class TestPromptUpdateExecution:
             scheduled_new_reqs=[],
             scheduled_cached_reqs=SimpleNamespace(request_ids=["req"]),
         )
-        # Second step completes chunk 0: apply runs (no peek), metadata staged.
+        # The second step completes chunk 0, but the next-chunk hook is
+        # deferred until the following runner call.  This gives the engine a
+        # chance to drain boundary RPCs before materializing chunk 1.
         chunk0 = DiffusionModelRunner.execute_stepwise(runner, cached).get_request_output("req")  # pyright: ignore[reportArgumentType]
         assert chunk0 is not None and chunk0.result is not None
         assert chunk0.result.started_event_ids == []
         state = runner.state_cache["req"]
+        assert torch.equal(state.prompt_embeds, torch.zeros(1, 4, 2))  # pyright: ignore[reportArgumentType]
+        assert state.interaction_chunk_metadata is None
+        pipeline.prepare_next_chunk.assert_not_called()  # pyright: ignore[reportAttributeAccessIssue]
+
+        # Preparation of chunk 1 applies the queued event exactly once.
+        DiffusionModelRunner.execute_stepwise(runner, cached)  # pyright: ignore[reportArgumentType]
         assert torch.equal(state.prompt_embeds, torch.ones(1, 4, 2))  # pyright: ignore[reportArgumentType]
         assert state.interaction_chunk_metadata is not None
         assert state.interaction_chunk_metadata.started_event_ids == ["ui-update-1"]
-        pipeline.prepare_next_chunk.assert_called()  # pyright: ignore[reportAttributeAccessIssue]
+        pipeline.prepare_next_chunk.assert_called_once()  # pyright: ignore[reportAttributeAccessIssue]
 
         # Next chunk decode attaches prior-boundary ACK ids onto DiffusionOutput.
-        DiffusionModelRunner.execute_stepwise(runner, cached)  # pyright: ignore[reportArgumentType]
         chunk1 = DiffusionModelRunner.execute_stepwise(runner, cached).get_request_output("req")  # pyright: ignore[reportArgumentType]
         assert chunk1 is not None and chunk1.result is not None
         assert chunk1.result.started_event_ids == ["ui-update-1"]

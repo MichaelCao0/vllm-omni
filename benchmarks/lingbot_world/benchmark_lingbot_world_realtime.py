@@ -66,6 +66,7 @@ from benchmarks.lingbot_world.workload import (  # noqa: E402
     DEFAULT_WARMUP_CHUNKS,
     DEFAULT_WIDTH,
     ChunkRecord,
+    InteractionRecord,
     Workload,
     aggregate_metrics,
     compute_metrics,
@@ -150,6 +151,7 @@ class SessionResult:
     video_start_s: float | None
     wall_s: float
     done_event: dict[str, Any]
+    interactions: list[InteractionRecord]
 
 
 async def _keepalive(websocket: Any, send_lock: asyncio.Lock, interval: float) -> None:
@@ -196,8 +198,9 @@ async def run_session(
     done_event: dict[str, Any] = {}
     send_lock = asyncio.Lock()
     keepalive: asyncio.Task[None] | None = None
-    # Fire remaining prompt updates in chunk order as their boundary passes.
-    updates = sorted(workload.prompt_updates, key=lambda update: update.after_chunk)
+    # Schedule live camera commands from observed chunk boundaries.
+    interactions: dict[str, InteractionRecord] = {}
+    updates = sorted(workload.camera_updates, key=lambda update: update.after_chunk)
     update_index = 0
 
     async with connect(url, max_size=None, ping_interval=None) as websocket:
@@ -226,6 +229,10 @@ async def run_session(
                 if isinstance(message, (bytes, bytearray)):
                     if pending is None:
                         raise BenchmarkError("Received a binary frame with no preceding video.chunk_metadata event.")
+                    if len(message) != pending.get("byte_length"):
+                        raise BenchmarkError("Media bytes do not match the preceding chunk metadata.")
+                    if pending.get("kind") == "media" and not message:
+                        raise BenchmarkError("Received an empty media chunk.")
                     if collect_media:
                         media.extend(message)
                     if pending.get("kind") == "media":
@@ -240,8 +247,17 @@ async def run_session(
                                 inter_arrival_s=arrival - (last_arrival if last_arrival is not None else 0.0),
                                 byte_length=len(message),
                                 num_frames=int(pending["num_frames"]),
+                                started_event_ids=tuple(pending.get("started_event_ids", [])),
+                                active_event_ids=tuple(pending.get("active_event_ids", [])),
+                                completed_event_ids=tuple(pending.get("completed_event_ids", [])),
                             )
                         )
+                        record = records[-1]
+                        for event_id in set(
+                            record.started_event_ids + record.active_event_ids + record.completed_event_ids
+                        ):
+                            if event_id in interactions:
+                                interactions[event_id].observe_media(record)
                         last_arrival = arrival
                         if print_chunks:
                             print(
@@ -252,7 +268,15 @@ async def run_session(
                             )
                         while update_index < len(updates) and updates[update_index].after_chunk <= index:
                             async with send_lock:
-                                await websocket.send(json.dumps(updates[update_index].to_payload(), ensure_ascii=False))
+                                update = updates[update_index]
+                                interaction = InteractionRecord(
+                                    event_id=update.event_id,
+                                    after_chunk=update.after_chunk,
+                                    send_start_s=time.perf_counter() - started,
+                                )
+                                interactions[update.event_id] = interaction
+                                await websocket.send(json.dumps(update.to_payload(), ensure_ascii=False))
+                                interaction.send_end_s = time.perf_counter() - started
                             update_index += 1
                     pending = None
                     continue
@@ -260,7 +284,15 @@ async def run_session(
                 event = json.loads(message)
                 event_type = event.get("type")
                 if event_type == "video.chunk_metadata":
+                    if pending is not None:
+                        raise BenchmarkError("Received new chunk metadata before the preceding chunk bytes.")
                     pending = event
+                elif event_type == "session.interaction.queued":
+                    event_id = event.get("event_id")
+                    if event_id not in interactions:
+                        raise BenchmarkError(f"Received acknowledgement for an unsent event: {event_id!r}.")
+                    if interactions[event_id].queued_s is None:
+                        interactions[event_id].queued_s = now - started
                 elif event_type == "video.start":
                     request_id = event.get("request_id")
                     video_start_s = now - started
@@ -274,6 +306,8 @@ async def run_session(
                         f"(requested {workload.num_chunks} chunks = num_frames {workload.num_frames})"
                     )
                 elif event_type == "session.done":
+                    if pending is not None:
+                        raise BenchmarkError("Session ended before the pending chunk bytes arrived.")
                     done_event = event
                     break
         finally:
@@ -306,6 +340,7 @@ async def run_session(
         video_start_s=video_start_s,
         wall_s=wall_s,
         done_event=done_event,
+        interactions=list(interactions.values()),
     )
 
 
@@ -588,6 +623,7 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "request_id": result.request_id,
                 "video_start_ms": (result.video_start_s * 1000.0) if result.video_start_s is not None else None,
                 "chunks": [record.to_dict() for record in result.records],
+                "interactions": [record.to_dict() for record in result.interactions],
                 "metrics": metrics,
             }
         )
@@ -632,7 +668,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         asyncio.run(run_benchmark(args))
-    except BenchmarkError as error:
+    except (BenchmarkError, ValueError) as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
     return 0

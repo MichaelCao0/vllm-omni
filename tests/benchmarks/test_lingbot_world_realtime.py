@@ -38,7 +38,8 @@ from benchmarks.lingbot_world.workload import (
     DEFAULT_WARMUP_CHUNKS,
     FRAMES_PER_BLOCK,
     ChunkRecord,
-    PromptUpdate,
+    CameraUpdate,
+    InteractionRecord,
     Workload,
     aggregate_metrics,
     build_camera_script,
@@ -130,39 +131,102 @@ def test_workload_rejects_geometry_the_cache_cannot_serve() -> None:
         Workload(prompt="p", image_reference=_IMAGE, camera_script=build_camera_script(1, "forward"), width=831)
 
 
-def test_prompt_update_beyond_the_rollout_is_rejected() -> None:
-    with pytest.raises(ValueError, match="never fires"):
+def test_unsupported_prompt_workload_is_rejected_before_resolving_media(tmp_path: Path) -> None:
+    path = tmp_path / "rollout.json"
+    path.write_text(
+        json.dumps({"image": _IMAGE, "num_chunks": 3, "prompt_updates": [{"after_chunk": 0, "prompt": "Rain"}]})
+    )
+
+    def unexpected_resolution(value):
+        pytest.fail("Invalid interaction must be rejected before media I/O")
+
+    with pytest.raises(ValueError, match="does not support prompt_updates"):
+        load_workload(path, image_resolver=unexpected_resolution)
+
+
+@pytest.mark.parametrize("boundary", [2, 3, 5])
+def test_camera_update_requires_a_later_chunk(boundary: int) -> None:
+    with pytest.raises(ValueError, match="later media chunk"):
         Workload(
-            prompt="p",
-            image_reference=_IMAGE,
-            camera_script=build_camera_script(2, "forward"),
-            prompt_updates=(PromptUpdate(after_chunk=5, prompt="later"),),
+            prompt="p", image_reference=_IMAGE, live_num_chunks=3, camera_updates=(CameraUpdate(after_chunk=boundary),)
         )
 
 
 @pytest.mark.parametrize("from_file", [False, True])
-def test_duplicate_prompt_update_boundaries_are_rejected(tmp_path: Path, from_file: bool) -> None:
-    updates = [
-        {"after_chunk": 1, "prompt": "Rain begins"},
-        {"after_chunk": 0, "prompt": "Clouds gather"},
-        {"after_chunk": 1, "prompt": "Rain stops"},
-    ]
-    with pytest.raises(ValueError, match="Duplicate prompt update after chunk 1"):
+def test_duplicate_camera_update_boundaries_are_rejected(tmp_path: Path, from_file: bool) -> None:
+    with pytest.raises(ValueError, match="Duplicate camera update"):
         if from_file:
             path = tmp_path / "rollout.json"
-            path.write_text(json.dumps({"image": _IMAGE, "num_chunks": 3, "prompt_updates": updates}))
-            build_workload(parse_args(["--workload", str(path)]))
+            path.write_text(
+                json.dumps(
+                    {
+                        "image": _IMAGE,
+                        "num_chunks": 3,
+                        "camera_mode": "live",
+                        "camera_updates": [{"after_chunk": 0}, {"after_chunk": 0}],
+                    }
+                )
+            )
+            load_workload(path)
         else:
             Workload(
                 prompt="p",
                 image_reference=_IMAGE,
-                camera_script=build_camera_script(3, "forward"),
-                prompt_updates=(
-                    PromptUpdate(after_chunk=1, prompt="Rain begins"),
-                    PromptUpdate(after_chunk=0, prompt="Clouds gather"),
-                    PromptUpdate(after_chunk=1, prompt="Rain stops"),
-                ),
+                live_num_chunks=3,
+                camera_updates=(CameraUpdate(after_chunk=0), CameraUpdate(after_chunk=0)),
             )
+
+
+@pytest.mark.parametrize("camera_field", ["camera_action_script", "camera_pattern"])
+def test_live_workload_rejects_static_camera_controls(tmp_path: Path, camera_field: str) -> None:
+    path = tmp_path / "rollout.json"
+    value = build_camera_script(3, "hold") if camera_field == "camera_action_script" else "hold"
+    path.write_text(json.dumps({"image": _IMAGE, "camera_mode": "live", "num_chunks": 3, camera_field: value}))
+    with pytest.raises(ValueError, match="cannot be combined"):
+        load_workload(path)
+
+
+@pytest.mark.parametrize("extra_key", ["camera_action_script", "action_path", "ar_diffusion_tick"])
+def test_extra_params_cannot_bypass_camera_mode(extra_key: str) -> None:
+    with pytest.raises(ValueError, match="not extra_params"):
+        Workload(prompt="p", image_reference=_IMAGE, live_num_chunks=3, extra_params={extra_key: []})
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"after_chunk": True},
+        {"after_chunk": 1.5},
+        {"mode": "wasd"},
+        {"translation": [1, 2]},
+        {"translation": [0, 0, float("nan")]},
+        {"rotation": [0, 0, 0, 0]},
+        {"rotation": [0, 0, 0, float("inf")]},
+        {"transition_chunks": -1},
+    ],
+)
+def test_camera_update_validates_structural_values(kwargs) -> None:
+    with pytest.raises(ValueError):
+        CameraUpdate(**({"after_chunk": 0} | kwargs))
+
+
+def test_live_payload_has_independent_length_and_no_fixed_script() -> None:
+    workload = Workload(
+        prompt="p",
+        image_reference=_IMAGE,
+        live_num_chunks=8,
+        camera_updates=(CameraUpdate(after_chunk=1, mode="velocity", translation=(0, 0, 0.1)),),
+    )
+    start = workload.session_start_payload("model")
+    assert start["num_frames"] == num_frames_for_chunks(8)
+    assert "camera_action_script" not in start["extra_params"]
+    event = workload.camera_updates[0].to_payload()["interaction"]
+    assert event["event_id"] == "camera-after-1"
+    assert event["event"]["multi_modal_data"]["camera"] == {
+        "mode": "velocity",
+        "data": {"translation": [0, 0, 0.1], "rotation": [0, 0, 0, 1]},
+    }
+    assert workload.describe()["camera_mode"] == "live"
 
 
 def test_workload_file_is_loaded_and_cli_overrides_win(tmp_path: Path) -> None:
@@ -173,10 +237,10 @@ def test_workload_file_is_loaded_and_cli_overrides_win(tmp_path: Path) -> None:
                 "prompt": "A quiet street",
                 "image": "https://example.invalid/frame.png",
                 "num_chunks": 4,
-                "camera_pattern": "hold",
+                "camera_mode": "live",
                 "fps": 12,
                 "seed": 7,
-                "prompt_updates": [{"after_chunk": 1, "prompt": "Rain begins", "transition_chunks": 2}],
+                "camera_updates": [{"after_chunk": 1, "translation": [0, 0, 1], "transition_chunks": 2}],
             }
         )
     )
@@ -185,7 +249,7 @@ def test_workload_file_is_loaded_and_cli_overrides_win(tmp_path: Path) -> None:
     assert workload.num_chunks == 4
     assert workload.fps == 24, "an explicit CLI value must beat the file"
     assert workload.seed == 7, "a None override must leave the file value alone"
-    assert workload.prompt_updates[0].transition_chunks == 2
+    assert workload.camera_updates[0].transition_chunks == 2
 
 
 def test_workload_file_without_a_rollout_length_is_rejected(tmp_path: Path) -> None:
@@ -418,7 +482,7 @@ def _serve(script):
 
 async def _emit_rollout(websocket, payload, *, intervals=None, chunks=None, trailer=True) -> None:
     """Replay the documented event order: start, metadata+binary per chunk, done."""
-    num_chunks = chunks if chunks is not None else len(payload["extra_params"]["camera_action_script"])
+    num_chunks = chunks if chunks is not None else chunks_for_num_frames(payload["num_frames"])
     await websocket.send(json.dumps({"type": "video.start", "request_id": "req-1", "format": "m4s"}))
     for index in range(num_chunks):
         if intervals is not None:
@@ -576,6 +640,39 @@ def test_a_server_error_event_aborts_the_session() -> None:
     _run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("events", "error"),
+    [
+        ([{"type": "video.chunk_metadata", "kind": "media"}, b"data"], "do not match"),
+        ([{"type": "video.chunk_metadata", "byte_length": 3}, b"data"], "do not match"),
+        ([{"type": "video.chunk_metadata", "kind": "media", "byte_length": 0}, b""], "empty media"),
+        ([{"type": "video.chunk_metadata"}, {"type": "video.chunk_metadata"}], "preceding chunk bytes"),
+        ([{"type": "video.chunk_metadata"}, {"type": "session.done"}], "pending chunk bytes"),
+        ([{"type": "session.interaction.queued", "event_id": "unknown"}], "unsent event"),
+    ],
+)
+def test_malformed_delivery_cannot_produce_interaction_metrics(events, error: str) -> None:
+    async def script(websocket, payload) -> None:
+        for event in events:
+            await websocket.send(event if isinstance(event, bytes) else json.dumps(event))
+
+    async def scenario() -> None:
+        async with _serve(script) as url:
+            with pytest.raises(BenchmarkError, match=error):
+                await run_session(
+                    url,
+                    "model",
+                    _workload(2),
+                    first_chunk_timeout=10,
+                    chunk_timeout=10,
+                    ping_interval=0,
+                    collect_media=False,
+                    print_chunks=False,
+                )
+
+    _run(scenario())
+
+
 def test_a_stalled_server_times_out_rather_than_hanging() -> None:
     workload = _workload(num_chunks=2)
 
@@ -646,30 +743,44 @@ def test_keepalive_pings_reach_the_server_during_a_slow_first_chunk() -> None:
     _run(scenario())
 
 
-def test_prompt_updates_are_sent_on_their_chunk_boundary() -> None:
+@pytest.mark.parametrize("ack_first", [True, False])
+def test_camera_update_ack_and_reported_media_can_arrive_in_either_order(ack_first: bool) -> None:
     workload = Workload(
         prompt="start",
         image_reference=_IMAGE,
-        camera_script=build_camera_script(3, "forward"),
-        prompt_updates=(PromptUpdate(after_chunk=0, prompt="Rain begins", transition_chunks=1),),
+        live_num_chunks=3,
+        camera_updates=(CameraUpdate(after_chunk=0, translation=(0, 0, 1)),),
     )
-    received: list[dict] = []
 
     async def script(websocket, payload) -> None:
-        async def drain() -> None:
-            async for message in websocket:
-                received.append(json.loads(message))
-
-        drainer = asyncio.create_task(drain())
-        await _emit_rollout(websocket, payload, intervals=[0.02, 0.15, 0.02], trailer=False)
-        await asyncio.sleep(0.05)
-        drainer.cancel()
+        assert "camera_action_script" not in payload["extra_params"]
+        await websocket.send(json.dumps({"type": "video.start", "request_id": "req-1"}))
+        for index in range(3):
+            metadata = {
+                "type": "video.chunk_metadata",
+                "kind": "media",
+                "generation_chunk_index": index,
+                "num_frames": pixel_frames_in_chunk(index),
+                "byte_length": 4,
+            }
+            if index == 1:
+                metadata["started_event_ids"] = ["camera-after-0"]
+                metadata["active_event_ids"] = ["camera-after-0"]
+            await websocket.send(json.dumps(metadata))
+            # Metadata alone must not count as receiving the media bytes.
+            if index == 1:
+                await asyncio.sleep(0.02)
+            await websocket.send(b"data")
+            if index == 0:
+                update = json.loads(await websocket.recv())
+                assert update == workload.camera_updates[0].to_payload()
+            if (index == 0 and ack_first) or (index == 1 and not ack_first):
+                await websocket.send(json.dumps({"type": "session.interaction.queued", "event_id": "camera-after-0"}))
+        await websocket.send(json.dumps({"type": "session.done", "stopped": False}))
 
     async def scenario() -> None:
-        server = _serve(script)
-        url = await server.__aenter__()
-        try:
-            await run_session(
+        async with _serve(script) as url:
+            result = await run_session(
                 url,
                 "model",
                 workload,
@@ -679,14 +790,51 @@ def test_prompt_updates_are_sent_on_their_chunk_boundary() -> None:
                 collect_media=False,
                 print_chunks=False,
             )
-        finally:
-            await server.__aexit__(None, None, None)
-        interactions = [event for event in received if event.get("type") == "session.interaction"]
-        assert len(interactions) == 1
-        assert interactions[0]["interaction"]["event"]["prompt"] == "Rain begins"
-        assert interactions[0]["interaction"]["transition_chunks"] == 1
+        interaction = result.interactions[0]
+        assert interaction.first_media_chunk == 1
+        assert interaction.first_media_s == result.records[1].arrival_s
+        assert interaction.queued_s is not None and interaction.send_end_s is not None
+        assert interaction.send_start_s <= interaction.send_end_s <= interaction.first_media_s
+        assert (interaction.queued_s < interaction.first_media_s) == ack_first
+        assert interaction.first_states == ("started", "active")
+        assert interaction.to_dict()["send_to_first_reported_media_ms"] >= 20
+        assert result.records[1].to_dict()["started_event_ids"] == ["camera-after-0"]
 
     _run(scenario())
+
+
+def test_unreported_event_is_unknown_not_dropped_or_completed() -> None:
+    interaction = InteractionRecord(event_id="late", after_chunk=8, send_start_s=5, send_end_s=5.01, queued_s=5.02)
+    interaction.observe_media(ChunkRecord(index=9, arrival_s=6, inter_arrival_s=1, byte_length=4, num_frames=12))
+    result = interaction.to_dict()
+    assert result["media_observation"] == "not_observed"
+    assert result["send_to_queued_ms"] == pytest.approx(20)
+    assert result["send_to_first_reported_media_ms"] is None
+    assert result["first_reported_states"] == []
+
+
+def test_superseded_reporting_is_preserved_without_claiming_action_completion() -> None:
+    record = InteractionRecord(event_id="replaced", after_chunk=0, send_start_s=1)
+    record.observe_media(
+        ChunkRecord(
+            index=1,
+            arrival_s=2,
+            inter_arrival_s=1,
+            byte_length=4,
+            num_frames=12,
+            started_event_ids=("replaced", "next"),
+            active_event_ids=("next",),
+            completed_event_ids=("replaced",),
+        )
+    )
+    record.observe_media(
+        ChunkRecord(
+            index=2, arrival_s=3, inter_arrival_s=1, byte_length=4, num_frames=12, completed_event_ids=("replaced",)
+        )
+    )
+    assert record.first_states == ("started", "completed")
+    assert record.first_media_s == 2
+    assert record.to_dict()["media_observation"] == "reported"
 
 
 @pytest.mark.parametrize("delivered", [0, 1])
@@ -702,6 +850,7 @@ def test_pongs_do_not_extend_media_deadlines(delivered) -> None:
                         "kind": "media",
                         "generation_chunk_index": 0,
                         "num_frames": 9,
+                        "byte_length": 5,
                     }
                 )
             )
